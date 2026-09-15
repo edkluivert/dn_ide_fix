@@ -1,0 +1,555 @@
+diff --git a/packages/flutter_tools/lib/src/dart/pub.dart b/packages/flutter_tools/lib/src/dart/pub.dart
+index 97c3547..8aebe14 100644
+--- a/packages/flutter_tools/lib/src/dart/pub.dart
++++ b/packages/flutter_tools/lib/src/dart/pub.dart
+@@ -428,14 +428,11 @@ class _DefaultPub implements Pub {
+     final (Set<String> closedDeps, String? savedPubspec, DateTime? pubspecMtime) =
+         _stripClosedDepsForPub(project.pubspecFile);
+ 
+-    // External (git/path) packages depending on closed names resolve via
+-    // dependency_overrides onto SDK header copies — see _closedOverrideDir.
+-    var overrideNames = const <String>{};
++    // The closed deps (and any an external git/path package needs) resolve via
++    // dependency_overrides onto SDK header copies, written both into the
++    // stripped pubspec and into pubspec_overrides.yaml — see _closedOverrideDir.
+     if (closedDeps.isNotEmpty) {
+-      overrideNames = _externalClosedNeeds(project);
+-      if (overrideNames.isNotEmpty) {
+-        _applyClosedOverrides(project, overrideNames);
+-      }
++      _applyClosedOverrides(project, <String>{...closedDeps, ..._externalClosedNeeds(project)});
+     }
+ 
+     final command = upgrade ? 'upgrade' : 'get';
+@@ -449,48 +446,20 @@ class _DefaultPub implements Pub {
+       if (enforceLockfile) '--enforce-lockfile',
+     ];
+     try {
+-      try {
+-        await _runWithStdioInherited(
+-          args,
+-          command: command,
+-          context: context,
+-          directory: directory,
+-          failureMessage: 'pub $command failed',
+-          flutterRootOverride: flutterRootOverride,
+-          outputMode: outputMode,
+-        );
+-      } on ToolExit {
+-        // A git dep's pubspec is unreadable before pub fetches it, so a
+-        // git-sourced package needing closed names is only discoverable by the
+-        // solve failing. Retry once with the framework override in place.
+-        final (Map<String, String> _, bool hasGit) = _externalSourceDeps(project.pubspecFile);
+-        if (closedDeps.isEmpty || overrideNames.isNotEmpty || !hasGit) {
+-          rethrow;
+-        }
+-        _logger.printStatus(
+-          'A git- or path-sourced package may depend on the DartNative framework — '
+-          'resolving it from the installed SDK and retrying...',
+-        );
+-        overrideNames = <String>{'dartnative', ..._externalClosedNeeds(project)};
+-        _applyClosedOverrides(project, overrideNames);
+-        await _runWithStdioInherited(
+-          args,
+-          command: command,
+-          context: context,
+-          directory: directory,
+-          failureMessage: 'pub $command failed',
+-          flutterRootOverride: flutterRootOverride,
+-          outputMode: outputMode,
+-        );
+-      }
++      await _runWithStdioInherited(
++        args,
++        command: command,
++        context: context,
++        directory: directory,
++        failureMessage: 'pub $command failed',
++        flutterRootOverride: flutterRootOverride,
++        outputMode: outputMode,
++      );
+     } finally {
+       await _restoreStrippedPubspec(project.pubspecFile, savedPubspec, pubspecMtime);
+     }
+     await _updateVersionAndPackageConfig(project);
+     await _injectClosedAfterPub(project, closedDeps, upgrade: upgrade);
+-    if (closedDeps.isNotEmpty) {
+-      _pruneClosedOverridesIfUnneeded(project);
+-    }
+   }
+ 
+ 
+@@ -1307,25 +1276,28 @@ class _DefaultPub implements Pub {
+     }
+   }
+ 
+-  /// External (git/path-sourced) packages may themselves depend on closed
+-  /// DartNative packages — a third-party plugin's `dartnative: ^1.0.0`. Those
+-  /// pubspecs belong to other repositories, so the strip can't touch them and
+-  /// pub would look for the name on pub.dev. The fix: `dependency_overrides`
+-  /// written during the solve (removed by the same restore as the strip),
+-  /// pointing at COPIES of the SDK header packages under
+-  /// `.dart_tool/dartnative_sdk/<name>`. Copies (not the SDK path, not
+-  /// symlinks) keep the lockfile entry RELATIVE and machine-independent —
++  /// The closed DartNative packages are not on pub.dev, so any pub run the dn
++  /// tool does not wrap — an IDE's "get dependencies", `dart pub get` in CI —
++  /// fails on them ("could not find package dartnative_skia at pub.dev"). And
++  /// external (git/path-sourced) packages may themselves depend on closed
++  /// names — a third-party plugin's `dartnative: ^1.0.0` — in pubspecs that
++  /// belong to other repositories, which the strip can't touch. The fix for
++  /// both: `dependency_overrides` pointing at COPIES of the SDK header
++  /// packages under `.dart_tool/dartnative_sdk/<name>` — written into the
++  /// stripped pubspec for the tool's own solve (removed by the same restore as
++  /// the strip) and into `pubspec_overrides.yaml`, which pub reads on every
++  /// resolve, for everyone else's. Copies (not the SDK path, not symlinks)
++  /// keep the lockfile entry RELATIVE and machine-independent —
+   /// `path: ".dart_tool/dartnative_sdk/<name>"` — so a committed lock stays
+   /// portable across machines and re-solves cleanly, and no `flutter`/SDK
+-  /// path ever appears in it. Windows needs no symlink support.
++  /// path ever appears in it. Windows needs no symlink support. Only the Dart
++  /// side of each package is copied (no ios/android/dart module dirs): the
++  /// copies serve resolution and analysis, never a build — [get] re-points
++  /// every closed package_config entry at the SDK before building.
+   ///
+-  /// Overrides are strictly conditional: pub adds every override to the
+-  /// resolution whether referenced or not, so writing them unconditionally
+-  /// would push closed entries into EVERY app's lock. They activate only when
+-  /// [_externalClosedNeeds] finds evidence (a path dep's pubspec declaring a
+-  /// closed name, a previous run's copies, a committed lock naming them) or
+-  /// after a failed solve in a project with git/path deps, and
+-  /// [_pruneClosedOverridesIfUnneeded] retires them when the need disappears.
++  /// Applied on every solve for the app's whole closed closure plus whatever
++  /// [_externalClosedNeeds] finds, and refreshed wholesale so an SDK update
++  /// propagates on the next solve.
+   Directory _closedOverrideDir(FlutterProject project) => project.directory
+       .childDirectory('.dart_tool')
+       .childDirectory('dartnative_sdk');
+@@ -1480,10 +1452,51 @@ class _DefaultPub implements Pub {
+     return out;
+   }
+ 
++  /// Per-package directories the header copies leave out: native modules,
++  /// compiled Dart modules and assets, which only a build reads — from the
++  /// SDK, never from a copy — and which dwarf the Dart side (28 MB of
++  /// xcframework against 52 KB of lib/ for dartnative_skia).
++  static const Set<String> _closedCopySkippedDirs = <String>{
++    'android',
++    'ios',
++    'macos',
++    'linux',
++    'windows',
++    'dart',
++    'assets',
++  };
++
++  /// Drops the top-level `flutter:`/`dartnative:` section (plugin platforms,
++  /// assets, fonts) from a header copy's pubspec, so the copy is a plain Dart
++  /// package. The natives it would describe are not copied, and a plugin
++  /// resolver that walks a package_config still pointing at the copies — a
++  /// stock Flutter tool an IDE was left on, a walk before [get] re-points the
++  /// entries — would otherwise fail on the missing Android main class. The
++  /// sections are read from the SDK's own header when they matter.
++  void _stripPluginSectionFromCopy(File pubspecFile) {
++    final String original = pubspecFile.readAsStringSync();
++    final out = <String>[];
++    var skipping = false;
++    for (final String line in pubspecLines(original)) {
++      if (RegExp(r'^(flutter|dartnative)\s*:').hasMatch(line)) {
++        skipping = true;
++        continue;
++      }
++      if (skipping && RegExp(r'^\S').hasMatch(line)) {
++        skipping = false;
++      }
++      if (!skipping) {
++        out.add(line);
++      }
++    }
++    pubspecFile.writeAsStringSync(out.join(lineEndingOf(original)));
++  }
++
+   /// Materializes header copies for [names] (plus their closed closure) under
+-  /// `.dart_tool/dartnative_sdk/` and merges matching `dependency_overrides`
+-  /// into the (already stripped) pubspec. Copies are refreshed wholesale, so
+-  /// an SDK update propagates on the next solve.
++  /// `.dart_tool/dartnative_sdk/`, merges matching `dependency_overrides` into
++  /// the (already stripped) pubspec and writes them to `pubspec_overrides.yaml`.
++  /// Copies are refreshed wholesale, so an SDK update propagates on the next
++  /// solve.
+   void _applyClosedOverrides(FlutterProject project, Set<String> names) {
+     final Map<String, List<String>> closure = _closedClosure(names);
+     final Directory root = _closedOverrideDir(project);
+@@ -1498,12 +1511,77 @@ class _DefaultPub implements Pub {
+       }
+       final Directory dest = root.childDirectory(name);
+       dest.createSync(recursive: true);
+-      copyDirectory(src, dest);
++      copyDirectory(
++        src,
++        dest,
++        shouldCopyDirectory: (Directory dir) =>
++            !_closedCopySkippedDirs.contains(_fileSystem.path.basename(dir.path)),
++      );
++      _stripPluginSectionFromCopy(dest.childFile('pubspec.yaml'));
+       overrides[name] = '.dart_tool/dartnative_sdk/$name';
+     }
+     if (overrides.isNotEmpty) {
+       _addClosedOverrideEntries(project.pubspecFile, overrides);
++      _writePubspecOverridesFile(project, overrides);
++      _syncIdeDartSdk(project);
++    }
++  }
++
++  /// Points an IntelliJ/Android Studio project at THIS SDK. The Flutter plugin
++  /// derives the Flutter SDK from the project's Dart SDK library
++  /// (`.idea/libraries/Dart_SDK.xml`), which `dn create` writes correctly — but
++  /// a project created by stock Flutter, ported, or copied between machines
++  /// carries another SDK's path, and the IDE's Run button then launches stock
++  /// `flutter run` on a DartNative app. Rewrites the file (same shape as the
++  /// create template) when it names a different Dart SDK; never creates it.
++  void _syncIdeDartSdk(FlutterProject project) {
++    final File library = project.directory
++        .childDirectory('.idea')
++        .childDirectory('libraries')
++        .childFile('Dart_SDK.xml');
++    if (!library.existsSync()) {
++      return;
++    }
++    final String dartSdk = _fileSystem.path.join(Cache.flutterRoot!, 'bin', 'cache', 'dart-sdk');
++    final String url = 'file://${_fileSystem.path.toUri(dartSdk).path}';
++    final String current = library.readAsStringSync();
++    if (current.contains('$url/lib/')) {
++      return;
+     }
++    // The IDE itself writes the path relative to the home directory.
++    final String? home = _platform.environment['HOME'] ?? _platform.environment['USERPROFILE'];
++    if (home != null && home.isNotEmpty) {
++      final String homeUrl = 'file://${_fileSystem.path.toUri(home).path}';
++      if (url.startsWith('$homeUrl/') &&
++          current.contains('file://\$USER_HOME\$${url.substring(homeUrl.length)}/lib/')) {
++        return;
++      }
++    }
++    const libs = <String>[
++      'async',
++      'collection',
++      'convert',
++      'core',
++      'developer',
++      'html',
++      'io',
++      'isolate',
++      'math',
++      'mirrors',
++      'typed_data',
++    ];
++    library.writeAsStringSync(<String>[
++      '<component name="libraryTable">',
++      '  <library name="Dart SDK">',
++      '    <CLASSES>',
++      for (final String lib in libs) '      <root url="$url/lib/$lib" />',
++      '    </CLASSES>',
++      '    <JAVADOC />',
++      '    <SOURCES />',
++      '  </library>',
++      '</component>',
++    ].join('\n'));
++    _logger.printStatus('dartnative: pointed the IDE project (.idea) at this SDK.');
+   }
+ 
+   /// Merges [overrides] (name → relative path) into the pubspec's
+@@ -1548,87 +1626,100 @@ class _DefaultPub implements Pub {
+     pubspecFile.writeAsStringSync(lines.join('\n'));
+   }
+ 
+-  /// Retires the override copies once nothing external references them: walks
+-  /// package_graph.json and keeps the copies only while some non-root,
+-  /// non-closed package depends on one of the copied names. Removing the dir
+-  /// makes the next solve pristine (the lock drops the entries by itself).
+-  void _pruneClosedOverridesIfUnneeded(FlutterProject project) {
+-    final Directory root = _closedOverrideDir(project);
+-    if (!root.existsSync()) {
+-      return;
+-    }
+-    final Set<String> names = <String>{
+-      for (final FileSystemEntity entity in root.listSync())
+-        if (entity is Directory) _fileSystem.path.basename(entity.path),
+-    };
+-    final File graphFile =
+-        project.directory.childDirectory('.dart_tool').childFile('package_graph.json');
+-    if (!graphFile.existsSync()) {
+-      return;
+-    }
+-    final Map<String, Object?> graph;
+-    try {
+-      graph = jsonDecode(graphFile.readAsStringSync()) as Map<String, Object?>;
+-    } on FormatException {
+-      return;
+-    }
+-    final Set<String> rootNames =
+-        (graph['roots'] as List<Object?>? ?? <Object?>[]).whereType<String>().toSet();
+-    final List<Map<String, Object?>> packages =
+-        (graph['packages'] as List<Object?>? ?? <Object?>[]).cast<Map<String, Object?>>();
+-    for (final Map<String, Object?> pkg in packages) {
+-      final String name = pkg['name']! as String;
+-      if (rootNames.contains(name)) {
+-        continue; // Root edges exist merely because the override was declared.
+-      }
+-      if (_dartNativePkgDir.childDirectory(name).existsSync()) {
+-        continue; // Closed packages resolve from the SDK regardless.
+-      }
+-      final List<String> deps =
+-          (pkg['dependencies'] as List<Object?>? ?? <Object?>[]).whereType<String>().toList();
+-      if (deps.any(names.contains)) {
+-        return; // Still needed.
+-      }
++  /// The comment lines that partition `pubspec_overrides.yaml` into the
++  /// author's own entries, the entries mirrored from the pubspec, and the block
++  /// dn manages — so a rewrite keeps the first and refreshes the other two.
++  static const String _overridesOwnMarker = '  # -- your overrides (kept as they are) --';
++  static const String _overridesMirroredMarker =
++      '  # -- mirrored from pubspec.yaml dependency_overrides (edit them there) --';
++  static const String _overridesManagedMarker =
++      '  # -- managed by dn: closed DartNative packages (rewritten on every resolve) --';
++
++  /// Writes `pubspec_overrides.yaml` with [overrides] (name → relative path)
++  /// so that pub runs the tool does not wrap — an IDE's "get dependencies",
++  /// `dart pub get` in CI — resolve the closed packages from the copies too.
++  ///
++  /// Pub reads the file's `dependency_overrides` in place of the pubspec's, so
++  /// the pubspec's own entries are mirrored in (the pubspec stays their source
++  /// of truth) and entries the author keeps in this file survive; only the
++  /// dn-managed block is rewritten. A name the author overrides is theirs.
++  void _writePubspecOverridesFile(FlutterProject project, Map<String, String> overrides) {
++    final File file = project.directory.childFile('pubspec_overrides.yaml');
++    var own = <String, List<String>>{};
++    if (file.existsSync()) {
++      final List<String> lines = pubspecLines(file.readAsStringSync());
++      final int ownAt = lines.indexOf(_overridesOwnMarker);
++      final int mirroredAt = lines.indexOf(_overridesMirroredMarker);
++      final int managedAt = lines.indexOf(_overridesManagedMarker);
++      // A file without our markers is entirely the author's.
++      own = _dependencyOverrideBlocks(
++        lines,
++        keep: (int line) =>
++            ownAt < 0 ||
++            (line > ownAt &&
++                (mirroredAt < 0 || line < mirroredAt) &&
++                (managedAt < 0 || line < managedAt)),
++      );
+     }
+-    root.deleteSync(recursive: true);
+-    // The lock still records the override entries, and _externalClosedNeeds
+-    // treats them as evidence — drop them too, or the next run re-applies the
+-    // override forever off its own residue.
+-    _removeClosedOverrideLockEntries(project, names);
+-    _logger.printTrace(
+-      'dartnative: external closed-package overrides no longer needed — removed',
+-    );
++    final Map<String, List<String>> mirrored = _dependencyOverrideBlocks(
++      pubspecLines(project.pubspecFile.readAsStringSync()),
++      keep: (int line) => true,
++    )..removeWhere((String name, _) => own.containsKey(name));
++    final out = <String>[
++      '# Generated by dn (`dn pub get`, `dn run`); new projects gitignore it.',
++      '#',
++      '# The closed DartNative packages (dartnative, dartnative_ios, …) ship inside',
++      '# the SDK, not on pub.dev. These overrides point them at header copies under',
++      '# .dart_tool/dartnative_sdk/ so a plain `dart pub get` — Android Studio,',
++      '# VS Code, CI — resolves them without the dn tool. After cloning, run',
++      '# `dn pub get` once to create the copies.',
++      'dependency_overrides:',
++      _overridesOwnMarker,
++      for (final List<String> block in own.values) ...block,
++      _overridesMirroredMarker,
++      for (final List<String> block in mirrored.values) ...block,
++      _overridesManagedMarker,
++      for (final MapEntry<String, String> e in overrides.entries)
++        if (!own.containsKey(e.key) && !mirrored.containsKey(e.key))
++          ...<String>['  ${e.key}:', '    path: ${e.value}'],
++      '',
++    ];
++    file.writeAsStringSync(out.join('\n'));
+   }
+ 
+-  /// Removes [names]' package blocks from pubspec.lock, but only blocks that
+-  /// point into `.dart_tool/dartnative_sdk/` — anything else is the author's.
+-  void _removeClosedOverrideLockEntries(FlutterProject project, Set<String> names) {
+-    final File lockFile = project.directory.childFile('pubspec.lock');
+-    if (!lockFile.existsSync()) {
+-      return;
+-    }
+-    final List<String> lines = pubspecLines(lockFile.readAsStringSync());
+-    final out = <String>[];
+-    var changed = false;
++  /// The entries of [lines]' `dependency_overrides:` section (name → the
++  /// entry's lines), skipping dn-managed ones and any whose first line [keep]
++  /// rejects.
++  Map<String, List<String>> _dependencyOverrideBlocks(
++    List<String> lines, {
++    required bool Function(int line) keep,
++  }) {
++    final blocks = <String, List<String>>{};
++    var inSection = false;
+     for (var i = 0; i < lines.length; i++) {
+-      final RegExpMatch? entry = RegExp(r'^  ([A-Za-z0-9_]+)\s*:\s*$').firstMatch(lines[i]);
+-      if (entry != null && names.contains(entry.group(1))) {
+-        var end = i + 1;
+-        while (end < lines.length && RegExp(r'^\s{4,}\S').hasMatch(lines[end])) {
+-          end++;
+-        }
+-        final String block = lines.sublist(i + 1, end).join('\n');
+-        if (block.contains('.dart_tool/dartnative_sdk/')) {
+-          i = end - 1;
+-          changed = true;
+-          continue;
+-        }
++      final String line = lines[i];
++      if (RegExp(r'^dependency_overrides\s*:').hasMatch(line)) {
++        inSection = true;
++        continue;
+       }
+-      out.add(lines[i]);
+-    }
+-    if (changed) {
+-      lockFile.writeAsStringSync(out.join('\n'));
++      if (RegExp(r'^\S').hasMatch(line)) {
++        inSection = false;
++      }
++      final RegExpMatch? entry = RegExp(r'^  ([A-Za-z0-9_]+)\s*:').firstMatch(line);
++      if (!inSection || entry == null) {
++        continue;
++      }
++      var end = i + 1;
++      while (end < lines.length && RegExp(r'^\s{4,}\S').hasMatch(lines[end])) {
++        end++;
++      }
++      final List<String> block = lines.sublist(i, end);
++      if (keep(i) && !block.join('\n').contains('.dart_tool/dartnative_sdk/')) {
++        blocks[entry.group(1)!] = block;
++      }
++      i = end - 1;
+     }
++    return blocks;
+   }
+ 
+   /// Injects [closedDeps] (plus their transitive closed closure) into the
+@@ -3408,60 +3499,30 @@ class _DefaultPub implements Pub {
+     var closedDeps = const <String>{};
+     String? savedPubspec;
+     DateTime? pubspecMtime;
+-    var overrideNames = const <String>{};
+     if (project != null && touchesPackageConfig && (command == 'get' || command == 'upgrade')) {
+       _ensureFreshFrameworkBake(project);
+       _ensureBakeReceiptMatchesEngine(project);
+       (closedDeps, savedPubspec, pubspecMtime) = _stripClosedDepsForPub(project.pubspecFile);
+-      // External (git/path) packages depending on closed names resolve via
+-      // dependency_overrides onto SDK header copies — see _closedOverrideDir.
++      // Mirror of get(): closed deps resolve via dependency_overrides onto SDK
++      // header copies — see _closedOverrideDir.
+       if (closedDeps.isNotEmpty) {
+-        overrideNames = _externalClosedNeeds(project);
+-        if (overrideNames.isNotEmpty) {
+-          _applyClosedOverrides(project, overrideNames);
+-        }
++        _applyClosedOverrides(project, <String>{...closedDeps, ..._externalClosedNeeds(project)});
+       }
+     }
+     try {
+-      try {
+-        await _runWithStdioInherited(
+-          arguments,
+-          command: command,
+-          directory: _fileSystem.currentDirectory.path,
+-          context: context,
+-          outputMode: outputMode,
+-        );
+-      } on ToolExit {
+-        // Mirror of get(): a git-sourced package needing closed names is only
+-        // discoverable by the solve failing — retry once with the override.
+-        final bool hasGit =
+-            project != null && _externalSourceDeps(project.pubspecFile).$2;
+-        if (closedDeps.isEmpty || overrideNames.isNotEmpty || !hasGit) {
+-          rethrow;
+-        }
+-        _logger.printStatus(
+-          'A git- or path-sourced package may depend on the DartNative framework — '
+-          'resolving it from the installed SDK and retrying...',
+-        );
+-        overrideNames = <String>{'dartnative', ..._externalClosedNeeds(project)};
+-        _applyClosedOverrides(project, overrideNames);
+-        await _runWithStdioInherited(
+-          arguments,
+-          command: command,
+-          directory: _fileSystem.currentDirectory.path,
+-          context: context,
+-          outputMode: outputMode,
+-        );
+-      }
++      await _runWithStdioInherited(
++        arguments,
++        command: command,
++        directory: _fileSystem.currentDirectory.path,
++        context: context,
++        outputMode: outputMode,
++      );
+     } finally {
+       await _restoreStrippedPubspec(project?.pubspecFile, savedPubspec, pubspecMtime);
+     }
+     if (touchesPackageConfig && project != null) {
+       await _updateVersionAndPackageConfig(project);
+       await _injectClosedAfterPub(project, closedDeps, upgrade: command == 'upgrade');
+-      if (closedDeps.isNotEmpty) {
+-        _pruneClosedOverridesIfUnneeded(project);
+-      }
+     }
+   }
+ 
+diff --git a/packages/flutter_tools/templates/app/.gitignore.tmpl b/packages/flutter_tools/templates/app/.gitignore.tmpl
+index baec903..87ceded 100644
+--- a/packages/flutter_tools/templates/app/.gitignore.tmpl
++++ b/packages/flutter_tools/templates/app/.gitignore.tmpl
+@@ -34,6 +34,7 @@ Desktop.ini
+ **/doc/api/
+ **/ios/DartNative/.last_build_id
+ .dart_tool/
++pubspec_overrides.yaml
+ .dn-plugins-dependencies
+ .pub-cache/
+ .pub/
+diff --git a/packages/flutter_tools/templates/package/.gitignore.tmpl b/packages/flutter_tools/templates/package/.gitignore.tmpl
+index dd5eb98..2edce75 100644
+--- a/packages/flutter_tools/templates/package/.gitignore.tmpl
++++ b/packages/flutter_tools/templates/package/.gitignore.tmpl
+@@ -26,6 +26,7 @@ migrate_working_dir/
+ /pubspec.lock
+ **/doc/api/
+ .dart_tool/
++pubspec_overrides.yaml
+ .flutter-plugins-dependencies
+ /build/
+ /coverage/
+diff --git a/packages/flutter_tools/templates/package_ffi/.gitignore.tmpl b/packages/flutter_tools/templates/package_ffi/.gitignore.tmpl
+index dd5eb98..2edce75 100644
+--- a/packages/flutter_tools/templates/package_ffi/.gitignore.tmpl
++++ b/packages/flutter_tools/templates/package_ffi/.gitignore.tmpl
+@@ -26,6 +26,7 @@ migrate_working_dir/
+ /pubspec.lock
+ **/doc/api/
+ .dart_tool/
++pubspec_overrides.yaml
+ .flutter-plugins-dependencies
+ /build/
+ /coverage/
+diff --git a/packages/flutter_tools/templates/plugin_shared/.gitignore.tmpl b/packages/flutter_tools/templates/plugin_shared/.gitignore.tmpl
+index b9d7f25..858f9e1 100644
+--- a/packages/flutter_tools/templates/plugin_shared/.gitignore.tmpl
++++ b/packages/flutter_tools/templates/plugin_shared/.gitignore.tmpl
+@@ -28,6 +28,7 @@ migrate_working_dir/
+ /pubspec.lock
+ **/doc/api/
+ .dart_tool/
++pubspec_overrides.yaml
+ .flutter-plugins-dependencies
+ /build/
+ /coverage/
