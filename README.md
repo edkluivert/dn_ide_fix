@@ -1,4 +1,55 @@
-# DartNative IDE pub fix
+# DartNative IDE fixes
+
+Two fixes for the `dn` tool, applied as a patch to your DartNative SDK.
+
+## Fix 2 (2026-09-30, SDK 113c27a): DevTools in Android Studio / IntelliJ
+
+**Symptom.** Opening DevTools (or the Flutter Inspector / Performance tabs) on a DartNative
+project fails after 15 seconds with:
+
+```
+DevTools server start-up failure.
+java.lang.Exception: Timed out waiting for Dart plugin to start DevTools.
+```
+
+**Cause.** The JetBrains Dart plugin starts the Dart Tooling Daemon and DevTools exactly once,
+in its project start-up activity, and only when a module of the project already carries the
+"Dart SDK" library at that moment. Nothing starts them later; changing the SDK afterwards only
+re-roots the analysis server. The Flutter plugin does not start DevTools itself any more: it waits
+for the Dart plugin's instance and gives up. So any project that was opened *before* its Dart SDK
+was configured has no DevTools for the whole session. That is the normal case for DartNative
+plugins and FFI packages: `dn create -t plugin|plugin_ffi|package_ffi` shipped no `.idea/`, and a
+folder first opened from the IDE gets an `.idea/` without an SDK. (App and package templates ship
+`.idea/libraries/Dart_SDK.xml`, which is why apps were fine.)
+
+**What the patch does.**
+
+1. `dn create -t plugin|plugin_ffi|package_ffi` now writes `.idea/modules.xml`,
+   `.idea/libraries/Dart_SDK.xml` and (for `package_ffi`) the module file, like the app and
+   package templates.
+2. `dn pub get`, `dn pub upgrade` and `dn run` check an existing `.idea/`: a missing
+   `.idea/libraries/Dart_SDK.xml` is written, and a Dart module (`<name>.iml` beside the pubspec or
+   in `.idea/`) missing the `Dart SDK` order entry gets it. Files that exist are never rewritten.
+   Android modules are left alone. When something was added the tool says so and asks for one
+   reopen of the project, since only a fresh open starts DevTools.
+
+**Verify.** After installing, in the affected project: `dn pub get`, then File → Close Project and
+open it again. Android Studio's log (Help → Show Log) should show
+`DartToolingDaemonService - Starting Dart Tooling Daemon` and
+`DartDevToolsService - Starting Dart DevTools` right after the LSP server starts, and the DevTools
+button works.
+
+Install: `./install.sh` (finds the SDK that owns `dn` on PATH; or pass the SDK folder). Re-run
+after every SDK update, because the installer script replaces the SDK folder and drops the patch.
+
+---
+
+## Fix 1 (2026-09-15, SDK 80edbf105e, OBSOLETE since SDK 113c27a): pubspec_overrides for IDE pub get
+
+Kept as `dn-ide-pub-overrides.patch` for reference. SDK 113c27a resolves the closed DartNative
+packages by itself, so this patch is no longer needed and no longer applies.
+
+### Original notes
 
 Makes DartNative projects resolve dependencies from **Android Studio, IntelliJ, VS Code
 or CI** with a plain `dart pub get`, so the green **Run** button just works.
@@ -29,6 +80,19 @@ It patches the `dn` tool inside your DartNative SDK so that every `dn pub get` o
 Pub reads `pubspec_overrides.yaml` automatically, so any pub get from any tool now
 succeeds. Before every build, `dn` still points the packages back at the real SDK,
 so nothing about how your app compiles changes.
+
+Two safety nets added 2026-09-24, after a project opened in Android Studio was built
+with the machine's *stock* Flutter SDK (the IDE fell back to its last known Flutter
+SDK because the project had no `.idea/libraries/Dart_SDK.xml`): the app ran, but
+every `MaterialSymbolsRounded` / `CupertinoIcons` glyph was a question-mark box,
+because the header copies carried no fonts.
+
+3. The copies now keep each package's `flutter: fonts:` entries and the font files
+   they name (about 2 MB for `dartnative`), so even a stock-Flutter build on the
+   copies bundles the icon fonts.
+4. `dn pub get` / `dn run` create `.idea/libraries/Dart_SDK.xml` when the IDE has
+   already created `.idea/` without one, so the IDE picks this SDK rather than
+   whatever Flutter it used last. A project with no `.idea/` at all is left alone.
 
 New projects from `dn create` gitignore `pubspec_overrides.yaml`. Your `pubspec.yaml`
 is never modified.

@@ -1,5 +1,5 @@
 diff --git a/packages/flutter_tools/lib/src/dart/pub.dart b/packages/flutter_tools/lib/src/dart/pub.dart
-index 97c3547..8aebe14 100644
+index 97c3547..1c1ed9a 100644
 --- a/packages/flutter_tools/lib/src/dart/pub.dart
 +++ b/packages/flutter_tools/lib/src/dart/pub.dart
 @@ -428,14 +428,11 @@ class _DefaultPub implements Pub {
@@ -124,14 +124,20 @@ index 97c3547..8aebe14 100644
    Directory _closedOverrideDir(FlutterProject project) => project.directory
        .childDirectory('.dart_tool')
        .childDirectory('dartnative_sdk');
-@@ -1480,10 +1452,51 @@ class _DefaultPub implements Pub {
+@@ -1480,11 +1452,128 @@ class _DefaultPub implements Pub {
      return out;
    }
  
 +  /// Per-package directories the header copies leave out: native modules,
 +  /// compiled Dart modules and assets, which only a build reads — from the
 +  /// SDK, never from a copy — and which dwarf the Dart side (28 MB of
-+  /// xcframework against 52 KB of lib/ for dartnative_skia).
++  /// xcframework against 52 KB of lib/ for dartnative_skia). The one
++  /// exception is the font files a package declares under `flutter: fonts:`
++  /// (the icon fonts of `dartnative`), copied file by file by
++  /// [_applyClosedOverrides]: a stock Flutter tool that builds the app on the
++  /// copies — an IDE whose Flutter SDK path is a stock Flutter, a full-path
++  /// `flutter run` — otherwise ships an empty FontManifest, and every
++  /// `MaterialSymbolsRounded`/`CupertinoIcons` glyph renders as a box.
 +  static const Set<String> _closedCopySkippedDirs = <String>{
 +    'android',
 +    'ios',
@@ -142,44 +148,116 @@ index 97c3547..8aebe14 100644
 +    'assets',
 +  };
 +
-+  /// Drops the top-level `flutter:`/`dartnative:` section (plugin platforms,
-+  /// assets, fonts) from a header copy's pubspec, so the copy is a plain Dart
-+  /// package. The natives it would describe are not copied, and a plugin
++  /// Drops the top-level `dartnative:` section and all of the `flutter:`
++  /// section except `fonts:` (plugin platforms, assets) from a header copy's
++  /// pubspec, so the copy is a plain Dart package that still declares its
++  /// fonts. The natives it would describe are not copied, and a plugin
 +  /// resolver that walks a package_config still pointing at the copies — a
 +  /// stock Flutter tool an IDE was left on, a walk before [get] re-points the
 +  /// entries — would otherwise fail on the missing Android main class. The
-+  /// sections are read from the SDK's own header when they matter.
++  /// sections are read from the SDK's own header when they matter. The fonts
++  /// stay (with their files, see [_closedCopySkippedDirs]) so that same stock
++  /// tool bundles the icon fonts.
 +  void _stripPluginSectionFromCopy(File pubspecFile) {
 +    final String original = pubspecFile.readAsStringSync();
 +    final out = <String>[];
-+    var skipping = false;
++    // '' outside any stripped section, else the top-level key being walked.
++    var section = '';
++    var keepingFonts = false;
++    var wroteFlutterKey = false;
 +    for (final String line in pubspecLines(original)) {
-+      if (RegExp(r'^(flutter|dartnative)\s*:').hasMatch(line)) {
-+        skipping = true;
++      final RegExpMatch? top = RegExp(r'^([A-Za-z_][A-Za-z0-9_-]*)\s*:').firstMatch(line);
++      if (top != null) {
++        final String key = top.group(1)!;
++        section = key == 'flutter' || key == 'dartnative' ? key : '';
++        keepingFonts = false;
++        if (section.isEmpty) {
++          out.add(line);
++        }
 +        continue;
 +      }
-+      if (skipping && RegExp(r'^\S').hasMatch(line)) {
-+        skipping = false;
++      if (section == 'dartnative') {
++        continue;
 +      }
-+      if (!skipping) {
-+        out.add(line);
++      if (section == 'flutter') {
++        final RegExpMatch? sub = RegExp(r'^  ([A-Za-z_][A-Za-z0-9_-]*)\s*:').firstMatch(line);
++        if (sub != null) {
++          keepingFonts = sub.group(1) == 'fonts';
++        } else if (RegExp(r'^\S').hasMatch(line)) {
++          // A column-0 comment or blank-ish line inside the section.
++          keepingFonts = false;
++        }
++        if (keepingFonts) {
++          if (!wroteFlutterKey) {
++            out.add('flutter:');
++            wroteFlutterKey = true;
++          }
++          out.add(line);
++        }
++        continue;
 +      }
++      out.add(line);
 +    }
 +    pubspecFile.writeAsStringSync(out.join(lineEndingOf(original)));
++  }
++
++  /// The font files a header's pubspec declares under `flutter: fonts:`, as
++  /// package-relative paths (`assets/fonts/MaterialSymbolsRounded.ttf`).
++  List<String> _declaredFontAssets(File pubspecFile) {
++    if (!pubspecFile.existsSync()) {
++      return const <String>[];
++    }
++    final out = <String>[];
++    var inFlutter = false;
++    var inFonts = false;
++    for (final String line in pubspecLines(pubspecFile.readAsStringSync())) {
++      if (RegExp(r'^[A-Za-z_][A-Za-z0-9_-]*\s*:').hasMatch(line)) {
++        inFlutter = RegExp(r'^flutter\s*:').hasMatch(line);
++        inFonts = false;
++        continue;
++      }
++      if (!inFlutter) {
++        continue;
++      }
++      final RegExpMatch? sub = RegExp(r'^  ([A-Za-z_][A-Za-z0-9_-]*)\s*:').firstMatch(line);
++      if (sub != null) {
++        inFonts = sub.group(1) == 'fonts';
++        continue;
++      }
++      if (!inFonts) {
++        continue;
++      }
++      final RegExpMatch? asset = RegExp(r'^\s+-?\s*asset\s*:\s*(\S+)').firstMatch(line);
++      if (asset != null) {
++        out.add(asset.group(1)!.replaceAll(RegExp(r'''^["']|["']$'''), ''));
++      }
++    }
++    return out;
 +  }
 +
    /// Materializes header copies for [names] (plus their closed closure) under
 -  /// `.dart_tool/dartnative_sdk/` and merges matching `dependency_overrides`
 -  /// into the (already stripped) pubspec. Copies are refreshed wholesale, so
 -  /// an SDK update propagates on the next solve.
+-  void _applyClosedOverrides(FlutterProject project, Set<String> names) {
 +  /// `.dart_tool/dartnative_sdk/`, merges matching `dependency_overrides` into
 +  /// the (already stripped) pubspec and writes them to `pubspec_overrides.yaml`.
 +  /// Copies are refreshed wholesale, so an SDK update propagates on the next
 +  /// solve.
-   void _applyClosedOverrides(FlutterProject project, Set<String> names) {
++  ///
++  /// A package's example app is resolved in the same pub run (`--example`)
++  /// against its own pubspec, which nothing strips or restores. It gets copies
++  /// and a `pubspec_overrides.yaml` of its own ([intoPubspec] false: its
++  /// pubspec is left untouched), which is all that resolution needs.
++  void _applyClosedOverrides(
++    FlutterProject project,
++    Set<String> names, {
++    bool intoPubspec = true,
++  }) {
      final Map<String, List<String>> closure = _closedClosure(names);
      final Directory root = _closedOverrideDir(project);
-@@ -1498,12 +1511,77 @@ class _DefaultPub implements Pub {
+     if (root.existsSync()) {
+@@ -1498,12 +1587,104 @@ class _DefaultPub implements Pub {
        }
        final Directory dest = root.childDirectory(name);
        dest.createSync(recursive: true);
@@ -190,13 +268,36 @@ index 97c3547..8aebe14 100644
 +        shouldCopyDirectory: (Directory dir) =>
 +            !_closedCopySkippedDirs.contains(_fileSystem.path.basename(dir.path)),
 +      );
++      for (final String asset in _declaredFontAssets(src.childFile('pubspec.yaml'))) {
++        final File font = _fileSystem.file(_fileSystem.path.join(src.path, asset));
++        if (!font.existsSync()) {
++          continue;
++        }
++        final File copy = _fileSystem.file(_fileSystem.path.join(dest.path, asset));
++        copy.parent.createSync(recursive: true);
++        font.copySync(copy.path);
++      }
 +      _stripPluginSectionFromCopy(dest.childFile('pubspec.yaml'));
        overrides[name] = '.dart_tool/dartnative_sdk/$name';
      }
      if (overrides.isNotEmpty) {
-       _addClosedOverrideEntries(project.pubspecFile, overrides);
+-      _addClosedOverrideEntries(project.pubspecFile, overrides);
++      if (intoPubspec) {
++        _addClosedOverrideEntries(project.pubspecFile, overrides);
++      }
 +      _writePubspecOverridesFile(project, overrides);
 +      _syncIdeDartSdk(project);
++    }
++    if (intoPubspec && project.hasExampleApp && project.example.pubspecFile.existsSync()) {
++      final FlutterProject example = project.example;
++      final Set<String> exampleClosed = _dartNativeClosedDeps(example.pubspecFile);
++      if (exampleClosed.isNotEmpty) {
++        _applyClosedOverrides(
++          example,
++          <String>{...exampleClosed, ..._externalClosedNeeds(example)},
++          intoPubspec: false,
++        );
++      }
 +    }
 +  }
 +
@@ -206,18 +307,22 @@ index 97c3547..8aebe14 100644
 +  /// a project created by stock Flutter, ported, or copied between machines
 +  /// carries another SDK's path, and the IDE's Run button then launches stock
 +  /// `flutter run` on a DartNative app. Rewrites the file (same shape as the
-+  /// create template) when it names a different Dart SDK; never creates it.
++  /// create template) when it names a different Dart SDK, and creates it when
++  /// the IDE has opened the project (`.idea/` exists) without one — the IDE
++  /// then falls back to its last known Flutter SDK, which on a machine that
++  /// also has stock Flutter is the wrong one (seen 2026-09-24: a package
++  /// scaffolded by hand, opened in Android Studio, built with stock Flutter
++  /// against the header copies — app ran, icon fonts missing). A project with
++  /// no `.idea/` at all is left alone.
 +  void _syncIdeDartSdk(FlutterProject project) {
-+    final File library = project.directory
-+        .childDirectory('.idea')
-+        .childDirectory('libraries')
-+        .childFile('Dart_SDK.xml');
-+    if (!library.existsSync()) {
++    final Directory idea = project.directory.childDirectory('.idea');
++    final File library = idea.childDirectory('libraries').childFile('Dart_SDK.xml');
++    if (!idea.existsSync()) {
 +      return;
 +    }
 +    final String dartSdk = _fileSystem.path.join(Cache.flutterRoot!, 'bin', 'cache', 'dart-sdk');
 +    final String url = 'file://${_fileSystem.path.toUri(dartSdk).path}';
-+    final String current = library.readAsStringSync();
++    final String current = library.existsSync() ? library.readAsStringSync() : '';
 +    if (current.contains('$url/lib/')) {
 +      return;
      }
@@ -243,6 +348,7 @@ index 97c3547..8aebe14 100644
 +      'mirrors',
 +      'typed_data',
 +    ];
++    library.parent.createSync(recursive: true);
 +    library.writeAsStringSync(<String>[
 +      '<component name="libraryTable">',
 +      '  <library name="Dart SDK">',
@@ -258,7 +364,7 @@ index 97c3547..8aebe14 100644
    }
  
    /// Merges [overrides] (name → relative path) into the pubspec's
-@@ -1548,87 +1626,100 @@ class _DefaultPub implements Pub {
+@@ -1548,87 +1729,100 @@ class _DefaultPub implements Pub {
      pubspecFile.writeAsStringSync(lines.join('\n'));
    }
  
@@ -434,7 +540,7 @@ index 97c3547..8aebe14 100644
    }
  
    /// Injects [closedDeps] (plus their transitive closed closure) into the
-@@ -3408,60 +3499,30 @@ class _DefaultPub implements Pub {
+@@ -3408,60 +3602,30 @@ class _DefaultPub implements Pub {
      var closedDeps = const <String>{};
      String? savedPubspec;
      DateTime? pubspecMtime;

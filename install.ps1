@@ -3,7 +3,7 @@
 param([string]$Sdk = "")
 $ErrorActionPreference = "Stop"
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Patch = Join-Path $Here "dn-ide-pub-overrides.patch"
+$Patch = Join-Path $Here "dn-ide-devtools.patch"
 
 if ($Sdk -eq "") {
   $dn = Get-Command dn.bat -ErrorAction SilentlyContinue
@@ -19,12 +19,12 @@ if (-not (Test-Path (Join-Path $Sdk "bin\dn.bat")) -or -not (Test-Path $Pub)) {
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Write-Error "git is required." }
 
 Write-Host "SDK: $Sdk"
-if (Select-String -Path $Pub -Pattern "_writePubspecOverridesFile" -Quiet) {
+if (Select-String -Path $Pub -Pattern "_registerIdeDartSdk" -Quiet) {
   Write-Host "Already installed. Nothing to do."; exit 0
 }
 git -C $Sdk apply --check $Patch
 if ($LASTEXITCODE -ne 0) {
-  Write-Error "The patch does not apply to this SDK version. It was made for DartNative 3.45.0-0.1.pre (framework 80edbf105e)."
+  Write-Error "The patch does not apply to this SDK version. It was made for DartNative SDK 113c27aacb2."
 }
 git -C $Sdk apply $Patch
 Write-Host "Patched. Rebuilding the dn tool (about 30 seconds)..."

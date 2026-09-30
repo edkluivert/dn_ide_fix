@@ -2,7 +2,7 @@
 # Reverts the DartNative IDE pub fix. Usage: ./uninstall.sh [/path/to/dartnative-sdk]
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PATCH="$HERE/dn-ide-pub-overrides.patch"
+PATCH="$HERE/dn-ide-devtools.patch"
 SDK="${1:-}"
 if [ -z "$SDK" ]; then
   DN="$(command -v dn || true)"
