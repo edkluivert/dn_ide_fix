@@ -3,8 +3,6 @@
 param([string]$Sdk = "")
 $ErrorActionPreference = "Stop"
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Patch = Join-Path $Here "dn-ide-devtools.patch"
-
 if ($Sdk -eq "") {
   $dn = Get-Command dn.bat -ErrorAction SilentlyContinue
   if (-not $dn) { $dn = Get-Command dn -ErrorAction SilentlyContinue }
@@ -19,18 +17,27 @@ if (-not (Test-Path (Join-Path $Sdk "bin\dn.bat")) -or -not (Test-Path $Pub)) {
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Write-Error "git is required." }
 
 Write-Host "SDK: $Sdk"
-if (Select-String -Path $Pub -Pattern "_registerIdeDartSdk" -Quiet) {
-  Write-Host "Already installed. Nothing to do."; exit 0
+$Applied = $false
+# Each fix is one patch, applied in order and skipped when its marker is already
+# in the tool sources. Fix 3 is made on top of Fix 2.
+function Apply-Fix([string]$Name, [string]$PatchFile, [string]$Marker) {
+  $Patch = Join-Path $Here $PatchFile
+  if (Select-String -Path $Pub -Pattern $Marker -Quiet) { Write-Host "$Name: already installed."; return }
+  git -C $Sdk apply --check $Patch
+  if ($LASTEXITCODE -ne 0) {
+    Write-Error "$Name does not apply to this SDK version. It was made for DartNative SDK 113c27aacb2."
+  }
+  git -C $Sdk apply $Patch
+  Write-Host "$Name: patched."
+  $script:Applied = $true
 }
-git -C $Sdk apply --check $Patch
-if ($LASTEXITCODE -ne 0) {
-  Write-Error "The patch does not apply to this SDK version. It was made for DartNative SDK 113c27aacb2."
-}
-git -C $Sdk apply $Patch
+Apply-Fix "Fix 2 (DevTools)" "dn-ide-devtools.patch" "_registerIdeDartSdk"
+Apply-Fix "Fix 3 (stock Flutter hand-off)" "dn-stock-flutter-handoff.patch" "_dependsOnDartNative"
+if (-not $Applied) { Write-Host "Nothing to do."; exit 0 }
 Write-Host "Patched. Rebuilding the dn tool (about 30 seconds)..."
 Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $Sdk "bin\cache\flutter_tools.snapshot"), (Join-Path $Sdk "bin\cache\flutter_tools.stamp")
 & (Join-Path $Sdk "bin\dn.bat") --version | Out-Null
 Write-Host ""
-Write-Host "Done. Every 'dn pub get' or 'dn run' now writes pubspec_overrides.yaml so"
-Write-Host "Android Studio / VS Code / CI pub get resolves the DartNative packages."
-Write-Host "In an existing project, run 'dn pub get' once."
+Write-Host "Done. 'dn create' and 'dn pub get' / 'dn run' now write the IDE's Dart SDK files"
+Write-Host "(reopen an existing project once), and the SDK's flutter.bat hands a project that"
+Write-Host "does not depend on dartnative to stock Flutter instead of editing its pubspec."

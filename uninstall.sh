@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Reverts the DartNative IDE pub fix. Usage: ./uninstall.sh [/path/to/dartnative-sdk]
+# Reverts the DartNative IDE / tool fixes. Usage: ./uninstall.sh [/path/to/dartnative-sdk]
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PATCH="$HERE/dn-ide-devtools.patch"
 SDK="${1:-}"
 if [ -z "$SDK" ]; then
   DN="$(command -v dn || true)"
@@ -11,11 +10,18 @@ if [ -z "$SDK" ]; then
   SDK="$(cd "$(dirname "$DN")/.." && pwd)"
 fi
 SDK="${SDK%/}"
-if ! git -C "$SDK" apply --check --reverse "$PATCH" 2>/dev/null; then
-  echo "error: the fix is not installed in $SDK (or the sources changed)." >&2
-  exit 1
-fi
-git -C "$SDK" apply --reverse "$PATCH"
+reverted=0
+# Reverse order of install.sh: Fix 3 sits on top of Fix 2.
+for patch in dn-stock-flutter-handoff.patch dn-ide-devtools.patch; do
+  if git -C "$SDK" apply --check --reverse "$HERE/$patch" 2>/dev/null; then
+    git -C "$SDK" apply --reverse "$HERE/$patch"
+    echo "$patch: reverted."
+    reverted=1
+  else
+    echo "$patch: not installed in $SDK (or the sources changed), skipped."
+  fi
+done
+[ "$reverted" = 1 ] || exit 1
 rm -f "$SDK/bin/cache/flutter_tools.snapshot" "$SDK/bin/cache/flutter_tools.stamp"
 "$SDK/bin/dn" --version >/dev/null
-echo "Reverted and rebuilt the dn tool. Delete pubspec_overrides.yaml from projects if you like."
+echo "Rebuilt the dn tool."

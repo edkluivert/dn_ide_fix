@@ -1,6 +1,44 @@
 # DartNative IDE fixes
 
-Two fixes for the `dn` tool, applied as a patch to your DartNative SDK.
+Three fixes for the `dn` tool, applied as patches to your DartNative SDK (`./install.sh`
+applies the current ones in order; Fix 1 is obsolete).
+
+## Fix 3 (2026-10-02, SDK 113c27a): a plain Flutter project must not run the DartNative tool
+
+**Symptom.** The DartNative SDK's `bin` folder is on PATH (the editor's SDK discovery wants a
+`flutter` there), so on a machine that also has stock Flutter, `flutter build` in a plain Flutter
+app silently runs DartNative's tool. Before this fix the launcher only printed a warning and
+carried on, and the tool's pub step then edited the app's committed files before pub failed:
+
+```
+dartnative: removed incompatible pubspec entry "flutter_test" (not supported by DartNative — …)
+Because … depends on flutter_localizations from sdk which doesn't exist … version solving failed.
+```
+
+`flutter_test: sdk: flutter` was deleted from `pubspec.yaml`, `.dart_tool/flutter_build` was wiped and
+a `dn_closed_sdk.stamp` left behind (custovia, 2026-10-02).
+
+**What the patch does.**
+
+1. `bin/flutter` (and `bin/dn`, the same file; `bin/flutter.bat` on Windows): when invoked as
+   `flutter` in a project whose pubspec names no `dartnative` / `dartnative_*` dependency, it
+   hands the whole command to stock Flutter: `$DN_STOCK_FLUTTER` (a `flutter` launcher or a
+   Flutter root) first, then every other `flutter` on PATH that is a real Flutter checkout, then
+   the usual install folders (`~/Development/flutter`, `~/flutter`, `~/fvm/default`, snap, `/opt`,
+   Homebrew). One stderr line says which one ran. With no stock Flutter found it warns and carries
+   on as before. Invoked as `dn`, nothing changes.
+2. `pub.dart`: a `_dependsOnDartNative(pubspec)` gate in front of the DartNative-only project
+   mutations, so even a direct `dn build` on a plain Flutter project rewrites nothing: the
+   `flutter_test` / `flutter_web_plugins` strip, the `.idea` Dart SDK registration (Fix 2), and
+   the closed-SDK stamp that clears `.dart_tool/flutter_build`. Pub then fails with its ordinary
+   message and the project is untouched.
+
+**Verify.** In a stock Flutter project with the DartNative `bin` first on PATH, `flutter --version`
+prints one `dn: … running stock Flutter at …` line on stderr and the stock version on stdout;
+`git status` shows no change to `pubspec.yaml`. In a DartNative project `dn pub get` behaves as
+before.
+
+---
 
 ## Fix 2 (2026-09-30, SDK 113c27a): DevTools in Android Studio / IntelliJ
 
@@ -167,8 +205,11 @@ your projects afterwards if you want them exactly as before.
 
 ## Files
 
-- `dn-ide-pub-overrides.patch` – the change to the SDK (one Dart file plus four
-  project templates), applied with `git apply`. It also makes `dn pub get` point a
-  project's `.idea` at this SDK when it names another one.
-- `install.sh` / `install.ps1` – installer for macOS/Linux and Windows
-- `uninstall.sh` – reverts it
+- `dn-ide-devtools.patch` – Fix 2: one Dart file plus the plugin / FFI project templates,
+  applied with `git apply`.
+- `dn-stock-flutter-handoff.patch` – Fix 3, made on top of Fix 2: `bin/flutter`, `bin/dn`,
+  `bin/flutter.bat` and the `_dependsOnDartNative` gate in the same Dart file.
+- `dn-ide-pub-overrides.patch` – Fix 1, obsolete; kept for SDK 80edbf105e only.
+- `install.sh` / `install.ps1` – installer for macOS/Linux and Windows (applies Fix 2 then Fix 3,
+  skipping what is already installed, and rebuilds the tool)
+- `uninstall.sh` – reverts them in reverse order
