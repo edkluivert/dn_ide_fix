@@ -1,0 +1,440 @@
+diff --git a/packages/flutter_tools/lib/src/dart/pub.dart b/packages/flutter_tools/lib/src/dart/pub.dart
+index d186621..205aa28 100644
+--- a/packages/flutter_tools/lib/src/dart/pub.dart
++++ b/packages/flutter_tools/lib/src/dart/pub.dart
+@@ -366,8 +366,8 @@ class _DefaultPub implements Pub {
+   /// that exists is the author's (or the IDE's) and is left alone.
+   void _registerIdeDartSdk(FlutterProject project) {
+     final Directory idea = project.directory.childDirectory('.idea');
+-    if (!idea.existsSync()) {
+-      return;
++    if (!idea.existsSync() || !_dependsOnDartNative(project.pubspecFile)) {
++      return; // A stock Flutter project's IDE must not be pointed at this SDK.
+     }
+     final String? root = Cache.flutterRoot;
+     if (root == null) {
+@@ -795,6 +795,9 @@ class _DefaultPub implements Pub {
+   /// project poisoned before this shipped has no stamp, so its first run
+   /// clears the bad kernel once.
+   void _invalidateKernelBuiltAgainstOtherClosedSdk(FlutterProject project) {
++    if (!_dependsOnDartNative(project.pubspecFile)) {
++      return; // Not a DartNative project: no closed SDK in its kernel, nothing to clear.
++    }
+     final String? root = Cache.flutterRoot;
+     if (root == null) {
+       return;
+@@ -1397,8 +1400,8 @@ class _DefaultPub implements Pub {
+   ///   - `flutter_test: sdk: flutter` from dev_dependencies
+   ///   - `flutter_web_plugins: sdk: flutter` from dependencies / dev_dependencies
+   void _stripUnsupportedPubspecEntries(File pubspecFile) {
+-    if (!pubspecFile.existsSync()) {
+-      return;
++    if (!pubspecFile.existsSync() || !_dependsOnDartNative(pubspecFile)) {
++      return; // Not a DartNative project: its pubspec is not ours to edit.
+     }
+ 
+     final String original = pubspecFile.readAsStringSync();
+@@ -2120,6 +2123,38 @@ class _DefaultPub implements Pub {
+   /// closed consumer from a framework-dev checkout. See docs/CLOSED_DISTRIBUTION_LESSONS.md.
+   Set<String> _dartNativeClosedDeps(File pubspecFile) => _closedDepConstraints(pubspecFile).keys.toSet();
+ 
++  /// Whether the project at [pubspecFile] is a DartNative project: it names
++  /// `dartnative` or a `dartnative_*` package under `dependencies`,
++  /// `dev_dependencies` or `dependency_overrides`, in any form (version,
++  /// path, git, sdk).
++  ///
++  /// GATE for every DartNative-specific project mutation. `zero/bin` puts a
++  /// `flutter` on PATH for the editor's SDK discovery, so on a machine that
++  /// also has stock Flutter a plain Flutter app can end up running this tool
++  /// (custovia, 2026-10-02: `flutter build appbundle` stripped `flutter_test`
++  /// out of its committed pubspec.yaml and wiped its build cache before pub
++  /// failed on `flutter_localizations`). A project that never asked for
++  /// DartNative gets a plain Flutter-tool run: nothing it owns is rewritten.
++  bool _dependsOnDartNative(File pubspecFile) {
++    if (!pubspecFile.existsSync()) {
++      return false;
++    }
++    var inDeps = false;
++    for (final String line in pubspecLines(pubspecFile.readAsStringSync())) {
++      if (RegExp(r'^(dependencies|dev_dependencies|dependency_overrides)\s*:').hasMatch(line)) {
++        inDeps = true;
++        continue;
++      }
++      if (RegExp(r'^\S').hasMatch(line)) {
++        inDeps = false;
++      }
++      if (inDeps && RegExp(r'^\s+dartnative(_[A-Za-z0-9_]+)?\s*:').hasMatch(line)) {
++        return true;
++      }
++    }
++    return false;
++  }
++
+   /// The app's closed deps plus the closed packages its resolved graph
+   /// reaches through other packages (public issue 49): an open package, from
+   /// a path, git or a registry, that depends on a first-party plugin the app
+diff --git a/bin/dn b/bin/dn
+index 6529d18..797224e 100755
+--- a/bin/dn
++++ b/bin/dn
+@@ -68,14 +68,61 @@ if [[ $OS =~ MINGW.* || $OS =~ CYGWIN.* || $OS =~ MSYS.* ]]; then
+   exec "${BIN_DIR}/flutter.bat" "$@"
+ fi
+ 
+-# This file is also installed as `dn`; the note below is for the `flutter` name
+-# only. `zero/bin` puts a `flutter` on PATH for the editor's SDK discovery, and
+-# a machine that also has stock Flutter can end up running this one on a plain
+-# Flutter project (a Linux Mint report, 2026-09-14). Say so, once, on stderr,
+-# and carry on: stdout stays clean for tools that parse it.
++# This file is also installed as `dn`; the block below is for the `flutter`
++# name only. `zero/bin` puts a `flutter` on PATH for the editor's SDK
++# discovery, and a machine that also has stock Flutter can end up running this
++# one on a plain Flutter project (a Linux Mint report, 2026-09-14; custovia,
++# 2026-10-02, where the DartNative tool then edited the app's committed
++# pubspec.yaml before pub failed). A project that does not depend on dartnative
++# is handed to stock Flutter when one can be found: $DN_STOCK_FLUTTER (a
++# `flutter` launcher or a Flutter root), then every other `flutter` on PATH,
++# then the usual install folders. Without one, say so on stderr and carry on
++# (the tool itself leaves a non-DartNative project's files alone); stdout stays
++# clean for tools that parse it.
++function stock_flutter() (
++  local candidate
++  local candidates=()
++  if [[ -n "$DN_STOCK_FLUTTER" ]]; then
++    candidates+=("$DN_STOCK_FLUTTER" "$DN_STOCK_FLUTTER/bin/flutter")
++  fi
++  local IFS=:
++  for dir in $PATH; do
++    candidates+=("$dir/flutter")
++  done
++  unset IFS
++  candidates+=(
++    "$HOME/Development/flutter/bin/flutter"
++    "$HOME/development/flutter/bin/flutter"
++    "$HOME/flutter/bin/flutter"
++    "$HOME/fvm/default/bin/flutter"
++    "$HOME/snap/flutter/common/flutter/bin/flutter"
++    "/opt/flutter/bin/flutter"
++    "/usr/local/flutter/bin/flutter"
++    "/opt/homebrew/share/flutter/bin/flutter"
++  )
++  for candidate in "${candidates[@]}"; do
++    [[ -f "$candidate" && -x "$candidate" ]] || continue
++    local resolved
++    resolved="$(follow_links "$candidate")"
++    # Not this SDK (by any name), and a real Flutter checkout: it has the
++    # tool sources and no DartNative framework beside them.
++    [[ "$(cd "${resolved%/*}" ; pwd -P)" == "$BIN_DIR" ]] && continue
++    local root="${resolved%/bin/*}"
++    [[ -d "$root/packages/flutter_tools" ]] || continue
++    [[ -e "$root/bin/internal/dn_sdk.source" || -d "$root/packages/dartnative" ]] && continue
++    echo "$resolved"
++    return 0
++  done
++  return 1
++)
++
+ if [[ "${PROG_NAME##*/}" == "flutter" && -f "pubspec.yaml" ]] \
+-   && ! grep -qE '^[[:space:]]*dartnative' pubspec.yaml; then
+-  >&2 echo "dn: this \`flutter\` is DartNative's ($BIN_DIR/flutter) and this project does not depend on dartnative. For stock Flutter, put its bin folder ahead of $BIN_DIR on your PATH, or run it by its full path."
++   && ! grep -qE '^[[:space:]]+dartnative(_[A-Za-z0-9_]+)?[[:space:]]*:' pubspec.yaml; then
++  if STOCK_FLUTTER="$(stock_flutter)"; then
++    >&2 echo "dn: this project does not depend on dartnative; running stock Flutter at $STOCK_FLUTTER instead of DartNative's $BIN_DIR/flutter (set DN_STOCK_FLUTTER to choose another)."
++    exec "$STOCK_FLUTTER" "$@"
++  fi
++  >&2 echo "dn: this \`flutter\` is DartNative's ($BIN_DIR/flutter) and this project does not depend on dartnative. No stock Flutter was found on PATH; install one or set DN_STOCK_FLUTTER to its bin/flutter."
+ fi
+ 
+ # To define `shared::execute()` function
+diff --git a/bin/flutter b/bin/flutter
+index 6529d18..797224e 100755
+--- a/bin/flutter
++++ b/bin/flutter
+@@ -68,14 +68,61 @@ if [[ $OS =~ MINGW.* || $OS =~ CYGWIN.* || $OS =~ MSYS.* ]]; then
+   exec "${BIN_DIR}/flutter.bat" "$@"
+ fi
+ 
+-# This file is also installed as `dn`; the note below is for the `flutter` name
+-# only. `zero/bin` puts a `flutter` on PATH for the editor's SDK discovery, and
+-# a machine that also has stock Flutter can end up running this one on a plain
+-# Flutter project (a Linux Mint report, 2026-09-14). Say so, once, on stderr,
+-# and carry on: stdout stays clean for tools that parse it.
++# This file is also installed as `dn`; the block below is for the `flutter`
++# name only. `zero/bin` puts a `flutter` on PATH for the editor's SDK
++# discovery, and a machine that also has stock Flutter can end up running this
++# one on a plain Flutter project (a Linux Mint report, 2026-09-14; custovia,
++# 2026-10-02, where the DartNative tool then edited the app's committed
++# pubspec.yaml before pub failed). A project that does not depend on dartnative
++# is handed to stock Flutter when one can be found: $DN_STOCK_FLUTTER (a
++# `flutter` launcher or a Flutter root), then every other `flutter` on PATH,
++# then the usual install folders. Without one, say so on stderr and carry on
++# (the tool itself leaves a non-DartNative project's files alone); stdout stays
++# clean for tools that parse it.
++function stock_flutter() (
++  local candidate
++  local candidates=()
++  if [[ -n "$DN_STOCK_FLUTTER" ]]; then
++    candidates+=("$DN_STOCK_FLUTTER" "$DN_STOCK_FLUTTER/bin/flutter")
++  fi
++  local IFS=:
++  for dir in $PATH; do
++    candidates+=("$dir/flutter")
++  done
++  unset IFS
++  candidates+=(
++    "$HOME/Development/flutter/bin/flutter"
++    "$HOME/development/flutter/bin/flutter"
++    "$HOME/flutter/bin/flutter"
++    "$HOME/fvm/default/bin/flutter"
++    "$HOME/snap/flutter/common/flutter/bin/flutter"
++    "/opt/flutter/bin/flutter"
++    "/usr/local/flutter/bin/flutter"
++    "/opt/homebrew/share/flutter/bin/flutter"
++  )
++  for candidate in "${candidates[@]}"; do
++    [[ -f "$candidate" && -x "$candidate" ]] || continue
++    local resolved
++    resolved="$(follow_links "$candidate")"
++    # Not this SDK (by any name), and a real Flutter checkout: it has the
++    # tool sources and no DartNative framework beside them.
++    [[ "$(cd "${resolved%/*}" ; pwd -P)" == "$BIN_DIR" ]] && continue
++    local root="${resolved%/bin/*}"
++    [[ -d "$root/packages/flutter_tools" ]] || continue
++    [[ -e "$root/bin/internal/dn_sdk.source" || -d "$root/packages/dartnative" ]] && continue
++    echo "$resolved"
++    return 0
++  done
++  return 1
++)
++
+ if [[ "${PROG_NAME##*/}" == "flutter" && -f "pubspec.yaml" ]] \
+-   && ! grep -qE '^[[:space:]]*dartnative' pubspec.yaml; then
+-  >&2 echo "dn: this \`flutter\` is DartNative's ($BIN_DIR/flutter) and this project does not depend on dartnative. For stock Flutter, put its bin folder ahead of $BIN_DIR on your PATH, or run it by its full path."
++   && ! grep -qE '^[[:space:]]+dartnative(_[A-Za-z0-9_]+)?[[:space:]]*:' pubspec.yaml; then
++  if STOCK_FLUTTER="$(stock_flutter)"; then
++    >&2 echo "dn: this project does not depend on dartnative; running stock Flutter at $STOCK_FLUTTER instead of DartNative's $BIN_DIR/flutter (set DN_STOCK_FLUTTER to choose another)."
++    exec "$STOCK_FLUTTER" "$@"
++  fi
++  >&2 echo "dn: this \`flutter\` is DartNative's ($BIN_DIR/flutter) and this project does not depend on dartnative. No stock Flutter was found on PATH; install one or set DN_STOCK_FLUTTER to its bin/flutter."
+ fi
+ 
+ # To define `shared::execute()` function
+diff --git a/bin/flutter.bat b/bin/flutter.bat
+index 8c7667f..1530b8b 100644
+--- a/bin/flutter.bat
++++ b/bin/flutter.bat
+@@ -1,85 +1,129 @@
+-@ECHO off
+-REM Copyright 2014 The Flutter Authors. All rights reserved.
+-REM Use of this source code is governed by a BSD-style license that can be
+-REM found in the LICENSE file.
+-
+-REM ---------------------------------- NOTE ----------------------------------
+-REM
+-REM Please keep the logic in this file consistent with the logic in the
+-REM `flutter` script in the same directory to ensure that Flutter & Dart
+-REM continue to work across all platforms!
+-REM
+-REM --------------------------------------------------------------------------
+-
+-SETLOCAL
+-
+-REM To debug the tool, you can uncomment the following line to enable debug mode:
+-REM SET FLUTTER_TOOL_ARGS="--enable-asserts %FLUTTER_TOOL_ARGS%"
+-
+-IF NOT DEFINED FLUTTER_STORAGE_BASE_URL (
+-    SET FLUTTER_STORAGE_BASE_URL=https://cdn.dartnative.com
+-)
+-
+-FOR %%i IN ("%~dp0..") DO SET FLUTTER_ROOT=%%~fi
+-REM `zero\bin` puts a `flutter` on PATH for the editor's SDK discovery; on a
+-REM machine that also has stock Flutter, a plain Flutter project can end up
+-REM running this one. Say so on stderr and carry on (mirrors bin/flutter).
+-IF EXIST "pubspec.yaml" (
+-  findstr /R /C:"^ *dartnative" pubspec.yaml >NUL 2>&1
+-  IF ERRORLEVEL 1 echo dn: this flutter is DartNative's, %FLUTTER_ROOT%\bin\flutter.bat, and this project does not depend on dartnative. For stock Flutter, put its bin folder ahead of %FLUTTER_ROOT%\bin on your Path, or run it by its full path. 1>&2
+-)
+-
+-REM If available, add location of bundled mingit to PATH
+-SET mingit_path=%FLUTTER_ROOT%\bin\mingit\cmd
+-IF EXIST "%mingit_path%" SET PATH=%PATH%;%mingit_path%
+-
+-REM Test if Git is available on the host
+-WHERE /Q git
+-IF "%ERRORLEVEL%" NEQ "0" (
+-  ECHO Error: Unable to find git in your PATH.
+-  EXIT /B 1
+-)
+-
+-REM Detect which PowerShell executable is available on the host
+-REM PowerShell version <= 5: PowerShell.exe
+-REM PowerShell version >= 6: pwsh.exe
+-WHERE /Q pwsh && (
+-    SET "powershell_executable=call pwsh"
+-) || WHERE /Q PowerShell.exe && (
+-    SET powershell_executable=PowerShell.exe
+-) || (
+-    ECHO Error: PowerShell executable not found.                        1>&2
+-    ECHO        Either pwsh.exe or PowerShell.exe must be in your PATH. 1>&2
+-    EXIT /B 1
+-)
+-
+-REM  Test if the flutter directory is a git clone, otherwise git rev-parse HEAD would fail
+-IF NOT EXIST "%flutter_root%\.git" (
+-  ECHO Error: The Flutter directory is not a clone of the GitHub project.
+-  ECHO        The flutter tool requires Git in order to operate properly;
+-  ECHO        to set up Flutter, run the following command:
+-  ECHO        git clone -b stable https://github.com/flutter/flutter.git
+-  EXIT 1
+-)
+-
+-REM Include shared scripts in shared.bat
+-SET shared_bin=%FLUTTER_ROOT%\bin\internal\shared.bat
+-CALL "%shared_bin%"
+-
+-SET flutter_tools_dir=%FLUTTER_ROOT%\packages\flutter_tools
+-SET cache_dir=%FLUTTER_ROOT%\bin\cache
+-SET snapshot_path=%cache_dir%\flutter_tools.snapshot
+-SET dart_sdk_path=%cache_dir%\dart-sdk
+-SET dart=%dart_sdk_path%\bin\dart.exe
+-
+-SET exit_with_errorlevel=%FLUTTER_ROOT%/bin/internal/exit_with_errorlevel.bat
+-
+-REM Chaining the call to 'dart' and 'exit' with an ampersand ensures that
+-REM Windows reads both commands into memory once before executing them. This
+-REM avoids nasty errors that may otherwise occur when the dart command (e.g. as
+-REM part of 'flutter upgrade') modifies this batch script while it is executing.
+-REM
+-REM Do not use the CALL command in the next line to execute Dart. CALL causes
+-REM Windows to re-read the line from disk after the CALL command has finished
+-REM regardless of the ampersand chain.
+-"%dart%" --packages="%flutter_tools_dir%\.dart_tool\package_config.json" %FLUTTER_TOOL_ARGS% "%snapshot_path%" %* & "%exit_with_errorlevel%"
++@ECHO off
++REM Copyright 2014 The Flutter Authors. All rights reserved.
++REM Use of this source code is governed by a BSD-style license that can be
++REM found in the LICENSE file.
++
++REM ---------------------------------- NOTE ----------------------------------
++REM
++REM Please keep the logic in this file consistent with the logic in the
++REM `flutter` script in the same directory to ensure that Flutter & Dart
++REM continue to work across all platforms!
++REM
++REM --------------------------------------------------------------------------
++
++SETLOCAL
++
++REM To debug the tool, you can uncomment the following line to enable debug mode:
++REM SET FLUTTER_TOOL_ARGS="--enable-asserts %FLUTTER_TOOL_ARGS%"
++
++IF NOT DEFINED FLUTTER_STORAGE_BASE_URL (
++    SET FLUTTER_STORAGE_BASE_URL=https://cdn.dartnative.com
++)
++
++FOR %%i IN ("%~dp0..") DO SET FLUTTER_ROOT=%%~fi
++REM `zero\bin` puts a `flutter` on PATH for the editor's SDK discovery; on a
++REM machine that also has stock Flutter, a plain Flutter project can end up
++REM running this one. Hand such a project to stock Flutter when one can be
++REM found (DN_STOCK_FLUTTER, then any other flutter.bat on Path); otherwise
++REM say so on stderr and carry on (mirrors bin/flutter).
++IF NOT EXIST "pubspec.yaml" GOTO :after_hand_off
++findstr /R /C:"^  *dartnative[_a-zA-Z0-9]* *:" pubspec.yaml >NUL 2>&1
++IF NOT ERRORLEVEL 1 GOTO :after_hand_off
++SET DN_STOCK=
++IF NOT "%DN_STOCK_FLUTTER%"=="" (
++  IF EXIST "%DN_STOCK_FLUTTER%\bin\flutter.bat" SET DN_STOCK=%DN_STOCK_FLUTTER%\bin\flutter.bat
++  IF EXIST "%DN_STOCK_FLUTTER%" IF NOT EXIST "%DN_STOCK_FLUTTER%\" SET DN_STOCK=%DN_STOCK_FLUTTER%
++)
++IF NOT "%DN_STOCK%"=="" GOTO :hand_off_found
++FOR /F "delims=" %%p IN ('where flutter.bat 2^>NUL') DO (
++  IF /I NOT "%%~fp"=="%FLUTTER_ROOT%\bin\flutter.bat" IF EXIST "%%~dpp..\packages\flutter_tools" IF NOT EXIST "%%~dpp..\bin\internal\dn_sdk.source" (
++    SET DN_STOCK=%%~fp
++    GOTO :hand_off_found
++  )
++)
++echo dn: this flutter is DartNative's, %FLUTTER_ROOT%\bin\flutter.bat, and this project does not depend on dartnative. No stock Flutter was found on Path; install one or set DN_STOCK_FLUTTER to its folder. 1>&2
++GOTO :after_hand_off
++
++:hand_off_found
++echo dn: this project does not depend on dartnative; running stock Flutter at %DN_STOCK% instead of DartNative's %FLUTTER_ROOT%\bin\flutter.bat ^(set DN_STOCK_FLUTTER to choose another^). 1>&2
++"%DN_STOCK%" %* & "%FLUTTER_ROOT%/bin/internal/exit_with_errorlevel.bat"
++
++:after_hand_off
++
++:hand_off_to_stock_flutter
++SET DN_STOCK=
++IF NOT "%DN_STOCK_FLUTTER%"=="" (
++  IF EXIST "%DN_STOCK_FLUTTER%\bin\flutter.bat" SET DN_STOCK=%DN_STOCK_FLUTTER%\bin\flutter.bat
++  IF EXIST "%DN_STOCK_FLUTTER%" IF NOT EXIST "%DN_STOCK_FLUTTER%\" SET DN_STOCK=%DN_STOCK_FLUTTER%
++)
++IF "%DN_STOCK%"=="" (
++  FOR /F "delims=" %%p IN ('where flutter.bat 2^>NUL') DO (
++    IF "%DN_STOCK%"=="" IF /I NOT "%%~fp"=="%FLUTTER_ROOT%\bin\flutter.bat" (
++      IF EXIST "%%~dpp..\packages\flutter_tools" IF NOT EXIST "%%~dpp..\bin\internal\dn_sdk.source" SET DN_STOCK=%%~fp
++    )
++  )
++)
++IF "%DN_STOCK%"=="" (
++  echo dn: this flutter is DartNative's, %FLUTTER_ROOT%\bin\flutter.bat, and this project does not depend on dartnative. No stock Flutter was found on Path; install one or set DN_STOCK_FLUTTER to its folder. 1>&2
++  EXIT /B 0
++)
++echo dn: this project does not depend on dartnative; running stock Flutter at %DN_STOCK% instead of DartNative's %FLUTTER_ROOT%\bin\flutter.bat ^(set DN_STOCK_FLUTTER to choose another^). 1>&2
++"%DN_STOCK%" %*
++EXIT %ERRORLEVEL%
++
++:after_hand_off
++
++REM If available, add location of bundled mingit to PATH
++SET mingit_path=%FLUTTER_ROOT%\bin\mingit\cmd
++IF EXIST "%mingit_path%" SET PATH=%PATH%;%mingit_path%
++
++REM Test if Git is available on the host
++WHERE /Q git
++IF "%ERRORLEVEL%" NEQ "0" (
++  ECHO Error: Unable to find git in your PATH.
++  EXIT /B 1
++)
++
++REM Detect which PowerShell executable is available on the host
++REM PowerShell version <= 5: PowerShell.exe
++REM PowerShell version >= 6: pwsh.exe
++WHERE /Q pwsh && (
++    SET "powershell_executable=call pwsh"
++) || WHERE /Q PowerShell.exe && (
++    SET powershell_executable=PowerShell.exe
++) || (
++    ECHO Error: PowerShell executable not found.                        1>&2
++    ECHO        Either pwsh.exe or PowerShell.exe must be in your PATH. 1>&2
++    EXIT /B 1
++)
++
++REM  Test if the flutter directory is a git clone, otherwise git rev-parse HEAD would fail
++IF NOT EXIST "%flutter_root%\.git" (
++  ECHO Error: The Flutter directory is not a clone of the GitHub project.
++  ECHO        The flutter tool requires Git in order to operate properly;
++  ECHO        to set up Flutter, run the following command:
++  ECHO        git clone -b stable https://github.com/flutter/flutter.git
++  EXIT 1
++)
++
++REM Include shared scripts in shared.bat
++SET shared_bin=%FLUTTER_ROOT%\bin\internal\shared.bat
++CALL "%shared_bin%"
++
++SET flutter_tools_dir=%FLUTTER_ROOT%\packages\flutter_tools
++SET cache_dir=%FLUTTER_ROOT%\bin\cache
++SET snapshot_path=%cache_dir%\flutter_tools.snapshot
++SET dart_sdk_path=%cache_dir%\dart-sdk
++SET dart=%dart_sdk_path%\bin\dart.exe
++
++SET exit_with_errorlevel=%FLUTTER_ROOT%/bin/internal/exit_with_errorlevel.bat
++
++REM Chaining the call to 'dart' and 'exit' with an ampersand ensures that
++REM Windows reads both commands into memory once before executing them. This
++REM avoids nasty errors that may otherwise occur when the dart command (e.g. as
++REM part of 'flutter upgrade') modifies this batch script while it is executing.
++REM
++REM Do not use the CALL command in the next line to execute Dart. CALL causes
++REM Windows to re-read the line from disk after the CALL command has finished
++REM regardless of the ampersand chain.
++"%dart%" --packages="%flutter_tools_dir%\.dart_tool\package_config.json" %FLUTTER_TOOL_ARGS% "%snapshot_path%" %* & "%exit_with_errorlevel%"
